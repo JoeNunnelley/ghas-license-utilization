@@ -5,6 +5,7 @@ import os
 import time
 import threading
 import concurrent.futures
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -19,7 +20,7 @@ logger = get_logger()
 CHECKPOINT_LOCK = threading.Lock()
 MAX_WORKERS = 5
 
-GRAPHQL_URL = "https://api.github.com/graphql"
+DEFAULT_SERVER_URL = "https://api.github.com"
 REQUEST_TIMEOUT = 30  # seconds
 MAX_RATE_LIMIT_RETRIES = 3
 # The refs query only fetches branch tips, so it can use large pages cheaply
@@ -66,6 +67,16 @@ def get_session(token):
     return session
 
 
+def get_graphql_url(server_url=DEFAULT_SERVER_URL):
+    # GitHub.com serves GraphQL at https://api.github.com/graphql; GHES at https://HOSTNAME/api/graphql
+    server_url = server_url.rstrip("/")
+    if server_url == DEFAULT_SERVER_URL:
+        return f"{server_url}/graphql"
+    # Remove any /api/vX suffix to get the base URL (supports v3, v4, etc.)
+    base_url = re.sub(r"/api/v\d+$", "", server_url)
+    return f"{base_url}/api/graphql"
+
+
 def github_request(method, url, token, **kwargs):
     # Send a request, sleeping and retrying when GitHub reports we are rate limited
     session = get_session(token)
@@ -76,12 +87,14 @@ def github_request(method, url, token, **kwargs):
     return response
 
 
-def graphql_query(query, variables, token, headers=None):
+def graphql_query(query, variables, token, headers=None, server_url=DEFAULT_SERVER_URL):
     response = github_request(
-        "POST", GRAPHQL_URL, token, json={"query": query, "variables": variables}, headers=headers
+        "POST", get_graphql_url(server_url), token, json={"query": query, "variables": variables}, headers=headers
     )
     if response.status_code == 401:
-        raise GitHubAPIError("401 Unauthorized: token is invalid or lacks required scopes", 401)
+        raise GitHubAPIError(
+            f"401 Unauthorized: token is invalid for {server_url} or lacks required scopes", 401
+        )
     if not response.ok:
         raise GitHubAPIError(f"HTTP {response.status_code}: {response.text[:200]}", response.status_code)
     try:
@@ -134,7 +147,9 @@ def add_active_committers_from_report(report, repositories):
                     repo.add_committer(user_login)
 
 
-def add_active_committers_from_api(repositories, token, group=1, checkpoint=None, max_workers=MAX_WORKERS):
+def add_active_committers_from_api(
+    repositories, token, group=1, checkpoint=None, max_workers=MAX_WORKERS, server_url=DEFAULT_SERVER_URL
+):
     logger.info(f"Fetching active committers from GitHub API...")
     completed = load_checkpoint(checkpoint)
     to_fetch = []
@@ -152,7 +167,7 @@ def add_active_committers_from_api(repositories, token, group=1, checkpoint=None
     )
 
     def fetch(repo):
-        active_committers = get_active_committers_in_last_90_days(repo.org, repo.name, token)
+        active_committers = get_active_committers_in_last_90_days(repo.org, repo.name, token, server_url)
         save_checkpoint(checkpoint, repo, active_committers)
         return active_committers
 
@@ -171,6 +186,11 @@ def add_active_committers_from_api(repositories, token, group=1, checkpoint=None
                     f"({len(active_committers)} active committers, {elapsed:.0f}s elapsed)"
                 )
             except (GitHubAPIError, requests.RequestException) as e:
+                if getattr(e, "status_code", None) == 401:
+                    # Every remaining request would fail the same way - stop instead of flagging each repository.
+                    # Repositories already fetched are in the checkpoint, so the run can be resumed.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
                 logger.warning(
                     f"[{group}:{i}/{len(to_fetch)}] Failed to fetch active committers for {repo.get_full_name()}: {e}"
                 )
@@ -183,11 +203,11 @@ def add_active_committers_from_api(repositories, token, group=1, checkpoint=None
         )
 
 
-def add_active_committers(report, repositories, token, group=1, checkpoint=None):
+def add_active_committers(report, repositories, token, group=1, checkpoint=None, server_url=DEFAULT_SERVER_URL):
     try:
         add_active_committers_from_report(report, repositories)
     except (Exception, TypeError) as e:
-        add_active_committers_from_api(repositories, token, group, checkpoint)
+        add_active_committers_from_api(repositories, token, group, checkpoint, server_url=server_url)
 
 
 def get_organizations(args, token):
@@ -195,20 +215,22 @@ def get_organizations(args, token):
     if not args.enterprise:
         orgs_in_ent.append(args.organization)
     else:
-        orgs_in_ent = get_orgs_in_ent(args.enterprise, token)
+        orgs_in_ent = get_orgs_in_ent(args.enterprise, token, args.server_url)
     return orgs_in_ent
 
 
 def process_organizations(orgs_in_ent, token, args=None):
+    server_url = getattr(args, "server_url", DEFAULT_SERVER_URL)
+    include_inactive = getattr(args, "include_inactive", False)
     total_repositories = []
     for i, org in enumerate(orgs_in_ent, start=1):
         logger.info(f"[{i}/{len(orgs_in_ent)}] Processing organization: {org}")
-        total_repositories.extend(get_ghas_status_for_repos(org, token, args))
+        total_repositories.extend(get_ghas_status_for_repos(org, token, server_url, include_inactive))
     return total_repositories
 
 
-def get_ghas_status_for_repos(org, token, args=None):
-    url = f"https://api.github.com/orgs/{org}/repos?per_page=100"
+def get_ghas_status_for_repos(org, token, server_url=DEFAULT_SERVER_URL, include_inactive=False):
+    url = f"{server_url.rstrip('/')}/orgs/{org}/repos?per_page=100"
     page = 1
     repos = []
 
@@ -219,6 +241,12 @@ def get_ghas_status_for_repos(org, token, args=None):
             logger.error(f"Request for {org} repositories (page {page}) failed: {e}")
             break
 
+        if response.status_code == 401:
+            raise GitHubAPIError(
+                f"401 Unauthorized listing repositories for {org}: token is invalid for {server_url} "
+                f"or lacks required scopes",
+                401,
+            )
         if response.ok:
             data = response.json()
             for repo_data in data:
@@ -235,7 +263,7 @@ def get_ghas_status_for_repos(org, token, args=None):
                 if not archived:
                     repo = Repository(name, owner, ghas_status, visibility, pushed_at)
                     repos.append(repo)
-                elif args is not None and args.include_inactive:
+                elif include_inactive:
                     logger.info(f"Including archived repository: {owner}/{name}")
                     repo = Repository(name, owner, ghas_status, visibility, pushed_at)
                     repos.append(repo)
@@ -246,7 +274,7 @@ def get_ghas_status_for_repos(org, token, args=None):
             page += 1
         else:
             logger.error(
-                f"Failed to list repositories for {org} (page {page}): "
+                f"Failed to list repositories for {org} from {server_url} (page {page}): "
                 f"{response.status_code}:{response.text[:200]}. Results for this org are incomplete."
             )
             break
@@ -313,7 +341,7 @@ def _parse_github_datetime(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _get_branches(org, repo, token):
+def _get_branches(org, repo, token, server_url=DEFAULT_SERVER_URL):
     # Returns (visibility, default branch name, [{"name", "oid", "committedDate"}])
     branches = []
     visibility = None
@@ -321,7 +349,7 @@ def _get_branches(org, repo, token):
     refs_after = None
     while True:
         variables = {"org": org, "repo": repo, "refsPageSize": REFS_PAGE_SIZE, "refsAfter": refs_after}
-        repository = graphql_query(BRANCHES_QUERY, variables, token).get("repository")
+        repository = graphql_query(BRANCHES_QUERY, variables, token, server_url=server_url).get("repository")
         if repository is None:
             raise GitHubAPIError(f"Repository {org}/{repo} not found or not accessible")
 
@@ -344,7 +372,7 @@ def _get_branches(org, repo, token):
         refs_after = page_info.get("endCursor")
 
 
-def get_active_committers_in_last_90_days(org, repo, token):
+def get_active_committers_in_last_90_days(org, repo, token, server_url=DEFAULT_SERVER_URL):
     # Raises GitHubAPIError / requests.RequestException if the repository can't be queried
     if org is None or repo is None:
         return list()
@@ -353,7 +381,7 @@ def get_active_committers_in_last_90_days(org, repo, token):
     since_dt = datetime.now(timezone.utc) - timedelta(days=90)
     since = since_dt.isoformat()
 
-    visibility, default_branch, branches = _get_branches(org, repo, token)
+    visibility, default_branch, branches = _get_branches(org, repo, token, server_url)
     if visibility == "PUBLIC":
         return list()
 
@@ -387,7 +415,7 @@ def get_active_committers_in_last_90_days(org, repo, token):
                 "historyAfter": history_after,
             }
             try:
-                data = graphql_query(BRANCH_HISTORY_QUERY, variables, token)
+                data = graphql_query(BRANCH_HISTORY_QUERY, variables, token, server_url=server_url)
             except GitHubAPIError as e:
                 # Repeated 502/504 means GitHub timed out on the query - retry the same page with a smaller one
                 if e.status_code in (502, 504) and page_size > MIN_HISTORY_PAGE_SIZE:
@@ -434,7 +462,7 @@ def get_active_committers_in_last_90_days(org, repo, token):
     return list(active_committers)
 
 
-def get_orgs_in_ent(enterprise_name, token):
+def get_orgs_in_ent(enterprise_name, token, server_url=DEFAULT_SERVER_URL):
     headers = {"X-Github-Next-Global-ID": "true"}
     orgs = []
     end_cursor = None
@@ -455,7 +483,7 @@ def get_orgs_in_ent(enterprise_name, token):
         }
         """
         variables = {"enterprise": enterprise_name, "after": end_cursor}
-        data = graphql_query(query, variables, token, headers=headers)
+        data = graphql_query(query, variables, token, headers=headers, server_url=server_url)
         logger.debug(json.dumps(data, indent=4))
 
         enterprise = data.get("enterprise")

@@ -19,7 +19,9 @@ def main():
     total_repositories = process_organizations(orgs_in_ent, token, args)
 
     logger.info(f"Adding active committers to {len(total_repositories)} repositories")
-    add_active_committers(args.ac_report, total_repositories, token, checkpoint=args.checkpoint)
+    add_active_committers(
+        args.ac_report, total_repositories, token, checkpoint=args.checkpoint, server_url=args.server_url
+    )
 
     # Generate report and print report
     logger.info(f"Generating report...")
